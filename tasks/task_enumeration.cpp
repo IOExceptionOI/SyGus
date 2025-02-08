@@ -3,6 +3,8 @@
 #include <string>
 #include <iostream>
 #include "glog/logging.h"
+#include "istool/sygus/theory/basic/clia/clia_example_sampler.h"
+#include "istool/basic/example_sampler.h"
 
 // Construct all programs with size 'size' expanded from grammar rule 'rule'.
 ProgramList constructPrograms(Rule* rule, int size, const std::vector<std::vector<ProgramList>>& program_storage);
@@ -31,14 +33,29 @@ PProgram synthesisFromExample(Grammar* grammar, const IOExampleList& examples, E
     std::vector<std::vector<ProgramList>> program_storage(grammar->symbol_list.size(), {{}});
 
     // TODO: (Task 1.2) Integrate observational equivalence to the enumeration below.
-    for (int size = 1;; ++size) {
+    // 从程序大小为1开始枚举，逐步增加程序大小
+    for (int size = 1; size <=4; ++size) {
+        // 记录当前枚举的程序大小
         LOG(INFO) << "Current size " << size;
+        
+        // 遍历语法中的所有非终结符
         for (auto* symbol: grammar->symbol_list) {
+            // 为当前非终结符在program_storage中添加一个新的空列表，用于存储该大小下的程序
             program_storage[symbol->id].emplace_back();
+            std::cout << "symbol: " << symbol->name << std::endl;
+            // 遍历该非终结符的所有产生式规则
             for (auto* rule: symbol->rule_list) {
+                // 使用当前规则和大小构造候选程序
+                
                 for (auto& candidate_program: constructPrograms(rule, size, program_storage)) {
+                    // 将生成的候选程序存储到对应的位置
+                    std::cout << "symbol :" << symbol->name << " rule: " << rule->toString() << " size :" << size << std::endl;
+                    std::cout << "candidate_program: " << candidate_program->toString() << std::endl;
                     program_storage[symbol->id][size].push_back(candidate_program);
+                    
+                    // 如果当前符号是起始符号，并且候选程序通过了验证器的检查
                     if (symbol->id == grammar->start->id && verifier(candidate_program.get())) {
+                        // 返回找到的满足条件的程序
                         return candidate_program;
                     }
                 }
@@ -47,31 +64,250 @@ PProgram synthesisFromExample(Grammar* grammar, const IOExampleList& examples, E
     }
 }
 
-PProgram cegis(Grammar* grammar, const IOExampleList& examples, Env* env) {
-    // TODO: (Task 1.1) Implement counter-example guided inductive synthesis
-    return synthesisFromExample(grammar, examples, env);
+// 增强版反例生成函数
+std::optional<IOExample> generateCounterExample(Program* candidate, FiniteIOExampleSpace* example_space, Env* env) {
+    // 策略1：边界值测试（针对CLIA类型）
+    if (auto clia_sampler = dynamic_cast<CLIAExampleSampler*>(example_space->sampler.get())) {
+        // 生成边界值组合
+        auto boundary_inputs = clia_sampler->generateBoundaryExamples(3); // 生成3个边界输入
+        for (auto& input : boundary_inputs) {
+            auto output = env->run(candidate, input.first);
+            auto expected = example_space->getOutput(input.first);
+            if (output != expected) {
+                return std::make_pair(input.first, expected);
+            }
+        }
+    }
+
+    // 策略2：符号执行引导生成
+    try {
+        // 创建符号变量
+        auto symbolic_input = example_space->createSymbolicInput();
+        auto symbolic_output = env->run(candidate, symbolic_input);
+        auto expected_output = example_space->getSymbolicOutput(symbolic_input);
+
+        // 构建约束条件：候选程序输出 ≠ 期望输出
+        auto constraint = env->getTheory()->createNEQConstraint(symbolic_output, expected_output);
+        
+        // 使用SMT求解器求解
+        auto model = env->getSolver()->getModel(constraint);
+        if (model.status == SAT_STATUS::SAT) {
+            ConcreteExample concrete_example;
+            for (auto& [name, var] : symbolic_input) {
+                concrete_example.first.push_back(model.getConcreteValue(var));
+            }
+            concrete_example.second = model.getConcreteValue(expected_output);
+            return concrete_example;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "符号执行错误: " << e.what() << std::endl;
+    }
+
+    // 策略3：基于程序结构的启发式生成
+    auto program_str = candidate->toString();
+    // 针对加法运算的边界测试
+    if (program_str.find("Plus") != std::string::npos) {
+        // 测试溢出情况
+        Value max_int = theory::clia::createCLIAValue(INT_MAX);
+        IOExample overflow_test{{max_int, max_int}, theory::clia::createCLIAValue(INT_MAX * 2)};
+        if (env->run(candidate, overflow_test.first) != overflow_test.second) {
+            return overflow_test;
+        }
+    }
+
+    // 策略4：增强随机测试
+    const int ENHANCED_RANDOM_TESTS = 500;
+    for (int i = 0; i < ENHANCED_RANDOM_TESTS; ++i) {
+        auto input = example_space->getRandomInput();
+        auto expected = example_space->getOutput(input.first);
+        auto actual = env->run(candidate, input.first);
+        
+        // 添加差异检测
+        if (actual != expected) {
+            // 记录失败案例
+            std::cout << "发现随机反例: ";
+            for (auto& v : input.first) std::cout << v.toString() << " ";
+            std::cout << "=> 实际:" << actual.toString() 
+                      << " 预期:" << expected.toString() << std::endl;
+            return std::make_pair(input.first, expected);
+        }
+    }
+
+    // 策略5：差分测试（如果有参考实现）
+    if (auto reference = example_space->getReferenceImplementation()) {
+        for (int i = 0; i < 100; ++i) {
+            auto input = example_space->getRandomInput().first;
+            auto candidate_out = env->run(candidate, input);
+            auto reference_out = env->run(reference.get(), input);
+            if (candidate_out != reference_out) {
+                return std::make_pair(input, reference_out);
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+PProgram cegis(Grammar* grammar, const IOExampleList& examples, Env* env, FiniteIOExampleSpace* example_space) {
+    // 初始化当前示例集合和迭代计数器
+    IOExampleList current_examples = examples;
+    const int MAX_ITERATIONS = 100;
+    int iteration = 0;
+
+    while (iteration++ < MAX_ITERATIONS) {
+        std::cout << "\n=== CEGIS 迭代 " << iteration << " ===" << std::endl;
+        std::cout << "当前示例数量: " << current_examples.size() << std::endl;
+
+        // 步骤1：程序综合
+        PProgram candidate = synthesisFromExample(grammar, current_examples, env);
+        
+        if (!candidate) {
+            std::cerr << "错误：无法生成候选程序" << std::endl;
+            return nullptr;
+        }
+        std::cout << "生成候选程序: " << candidate->toString() << std::endl;
+
+        // 步骤2：完全验证
+        bool is_valid = true;
+        IOExampleList failed_examples;
+        for (auto& example : example_space->example_space) {
+            auto io = example_space->getIOExample(example);
+            auto output = env->run(candidate.get(), io.first);
+            if (output != io.second) {
+                is_valid = false;
+                failed_examples.push_back(io);
+            }
+        }
+
+        if (is_valid) {
+            std::cout << "找到有效程序: " << candidate->toString() << std::endl;
+            return candidate;
+        }
+
+        // 步骤3：反例生成
+        if (!failed_examples.empty()) {
+            // 选择第一个失败示例作为反例
+            auto counter_example = failed_examples.front();
+            current_examples.push_back(counter_example);
+            
+            std::cout << "发现反例: 输入[";
+            for (auto& v : counter_example.first) std::cout << v.toString() << " ";
+            std::cout << "] 预期输出: " << counter_example.second.toString() << std::endl;
+
+            // 在反例生成后添加语法分析
+            analyzeCounterExample(counter_example, grammar);  // 新增语法分析
+        } else {
+            // 高级反例生成（需要实现generateCounterExample）
+            auto new_counter = generateCounterExample(candidate.get(), example_space, env);
+            if (new_counter) {
+                current_examples.push_back(*new_counter);
+                std::cout << "生成新反例: 输入[";
+                for (auto& v : new_counter->first) std::cout << v.toString() << " ";
+                std::cout << "] 预期输出: " << new_counter->second.toString() << std::endl;
+            } else {
+                std::cerr << "错误：无法生成新反例" << std::endl;
+                return nullptr;
+            }
+        }
+    }
+
+    std::cerr << "错误：超过最大迭代次数 (" << MAX_ITERATIONS << ")" << std::endl;
+    return nullptr;
+}
+
+// 新增反例分析函数
+void analyzeCounterExample(const IOExample& counter_example, Grammar* grammar) {
+    // 分析输入类型特征
+    std::cout << "\n反例分析报告:" << std::endl;
+    std::cout << "输入特征: ";
+    for (const auto& val : counter_example.first) {
+        if (auto int_val = dynamic_cast<IntValue*>(val.get())) {
+            if (int_val->value == 0) std::cout << "[零值] ";
+            else if (int_val->value < 0) std::cout << "[负值] ";
+            else std::cout << "[正值] ";
+        }
+    }
+    
+    // 根据反例调整语法权重
+    if (counter_example.second.getType() == "Int") {
+        auto& start_rules = grammar->getStartSymbol()->rule_list;
+        for (auto& rule : start_rules) {
+            if (rule->toString().find("Plus") != std::string::npos) {
+                rule->weight *= 1.2;  // 增加加法规则的优先级
+            }
+        }
+    }
+    
+    std::cout << "\n已调整语法规则权重" << std::endl;
 }
 
 int main(int argv, char** argc) {
+    // 初始化任务路径
     std::string task_path;
+    
+    // 如果命令行参数为2，使用第一个参数作为任务路径
     if (argv == 2) {
         task_path = std::string(argc[1]);
-    } else task_path = config::KSourcePath + "/tests/plus.sl";
-
-    auto spec = parser::getSyGuSSpecFromFile(task_path);
-    auto* example_space = dynamic_cast<FiniteIOExampleSpace*>(spec->example_space.get());
-    IOExampleList io_examples;
-    for (auto& example: example_space->example_space) {
-        io_examples.push_back(example_space->getIOExample(example));
+    } 
+    // 否则使用默认的测试文件路径
+    else {
+        task_path = config::KSourcePath + "/tests/plus.sl";
     }
-    auto* grammar = spec->info_list[0]->grammar;
+    std::cout << "任务文件: " << task_path << std::endl;
 
+    // 从文件中解析SyGuS规范
+    auto spec = parser::getSyGuSSpecFromFile(task_path);
+    if (spec->info_list.empty()) {
+        std::cerr << "错误：规范信息列表为空" << std::endl;
+        return 1;
+    }
+    std::cout << "目标函数: " << spec->info_list[0]->name << std::endl;
+    
+    // 将示例空间转换为有限IO示例空间
+    auto* example_space = dynamic_cast<FiniteIOExampleSpace*>(spec->example_space.get());
+    if (!example_space) {
+        std::cerr << "错误：示例空间类型不匹配" << std::endl;
+        return 1;
+    }
+    std::cout << "示例数量: " << example_space->example_space.size() << std::endl;
+    
+    // 初始化IO示例列表
+    IOExampleList io_examples;
+    
+    // 遍历示例空间中的所有示例，将其转换为IO示例并添加到列表中
+    for (auto& example: example_space->example_space) {
+        auto io = example_space->getIOExample(example);
+        io_examples.push_back(io);
+        std::cout << "示例: ";
+        for (auto& v : io.first) std::cout << v.toString() << " ";
+        std::cout << "=> " << io.second.toString() << std::endl;
+    }
+    
+    // 获取语法规则
+    auto* grammar = spec->info_list[0]->grammar;
+    std::cout << "语法规则:" << std::endl;
+    for (auto* symbol : grammar->symbol_list) {
+        std::cout << symbol->name << ": \n";
+        for (auto* rule : symbol->rule_list) {
+            std::cout << rule->toString() << "\n";
+        }
+        std::cout << std::endl;
+    }
+
+    // 创建并启动计时器
     auto* recorder = new TimeRecorder();
     recorder->start("synthesis");
-    auto res = cegis(grammar, io_examples, spec->env.get());
+    
+    // 使用CEGIS算法进行程序综合
+    auto res = cegis(grammar, io_examples, spec->env.get(), example_space);
+    
+    // 停止计时器
     recorder->end("synthesis");
 
+    // 输出综合结果
     std::cout << "Result: " << res->toString() << std::endl;
+    
+    // 输出综合耗时
     std::cout << "Time Cost: " << recorder->query("synthesis") << " seconds";
 }
 
@@ -91,25 +327,42 @@ namespace {
     }
 
     void _getAllSizeScheme(int pos, int rem, const std::vector<std::vector<int>>& pool, std::vector<int>& tmp, std::vector<std::vector<int>>& res) {
+        // pos == pool.size() 表示所有参数的size都已经确定
         if (pos == pool.size()) {
+            // rem == 0 说明各个参数的size和达到总size - 1
             if (rem == 0) res.push_back(tmp); return;
         }
         for (auto size: pool[pos]) {
+            // size > rem 说明当前参数的size超过了剩余的size，剩下的都跳过
             if (size > rem) continue;
             tmp.push_back(size);
+            // 当前pos参数的size选好了，处理pos + 1的参数, 剩余的size减去当前参数的size
             _getAllSizeScheme(pos + 1, rem - size, pool, tmp, res);
+            // 因为是DFS, 当前pos参数为size的组合已经遍历完了，所以需要回溯
             tmp.pop_back();
         }
     }
 
     // Construct programs expanded from rule @rule from a pool of sub-programs
+    /*
+        pos 表示当前正在处理的sub_programs中的program的pos
+        sub_programs是各个scheme中，各个param的program列表的集合
+        rule 表示当前正在处理的rule
+        sub_list 表示当前正在处理的program列表
+        res 表示所有组合的program列表
+    */
     void buildAllCombination(int pos, const std::vector<ProgramList>& sub_programs, Rule* rule, ProgramList& sub_list, ProgramList& res) {
+        // 如果当前pos已经处理完了所有param, 则将当前program列表加入到res中
         if (pos == sub_programs.size()) {
             res.push_back(rule->buildProgram(sub_list)); return;
         }
+        // 遍历当前pos的program列表
         for (auto& sub_program: sub_programs[pos]) {
+            // 将当前program加入到sub_list中
             sub_list.push_back(sub_program);
+            // 递归处理下一个pos
             buildAllCombination(pos + 1, sub_programs, rule, sub_list, res);
+            // 因为是DFS, 所以当前pos的param对应的后续所有可能都找完了后回溯
             sub_list.pop_back();
         }
     }
@@ -117,20 +370,53 @@ namespace {
 
 ProgramList constructPrograms(Rule* rule, int size, const std::vector<std::vector<ProgramList>>& program_storage) {
     std::vector<std::vector<int>> size_pool;
+    std::cout << "================================================" << std::endl;
+    std::cout << "constructPrograms 开始" << std::endl;
+    std::cout << "rule内容: " << std::endl;
+    std::cout << rule->toString() << std::endl;
+    
+    int index = 0;
+    std::cout << "para_list: " << std::endl;
     for (auto* nt: rule->param_list) {
         std::vector<int> size_list;
+        
+        
+        std::cout << "--------------------------------" << std::endl;
+        std::cout << "nt_"  << index++ << ": " << nt->name << std::endl;
+        std::cout << "--------------------------------" << std::endl;
+
         for (int i = 0; i < size; ++i) {
-            if (!program_storage[nt->id][i].empty()) size_list.push_back(i);
+            if (!program_storage[nt->id][i].empty()) {
+                size_list.push_back(i);
+                std::cout << "size_list.push_back: " << i << std::endl;
+                std::cout << "program_storage[" << nt->id << "][" << i << "] 内容: " << std::endl;
+                for (const auto& program : program_storage[nt->id][i]) {
+                    std::cout << "  " << program->toString() << std::endl;
+                }
+            }
         }
         size_pool.push_back(size_list);
     }
     ProgramList res;
+
+    // 获取所有可能的size组合
     for (const auto& scheme: getAllSizeScheme(size - 1, size_pool)) {
+        // scheme 是参数的size总和为size -  1的组合, 每个pos对应当前rule的para_list中的一个param的size
+        // eg. scheme = [1, 2, 3], 表示第一个param的size为1, 第二个param的size为2, 第三个param的size为3
         ProgramStorage sub_programs;
         for (int i = 0; i < scheme.size(); ++i) {
+            // 根据scheme中的size, 从program_storage中获取对应的program
+            // [rule->param_list[i]->id][scheme[i]] 表示从program_storage中获取对应非终结符param的size为scheme[i]的program
             sub_programs.push_back(program_storage[rule->param_list[i]->id][scheme[i]]);
         }
         ProgramList sub_list;
+        // 例如当前rule为：+(Start,Start)，当前size为3
+        // 遍历sub_programs中的所有program, 将它们组合成一个program
+        // eg. 第一个param的size为1, 第二个param的size为1, size和为 size - 1 = 2
+        // start 有 0 1 2 param0 param1 五种program
+        // 组合后为：
+        // +(0, 0) +(0, 1) +(0, 2) +(param0, 0) +(param0, 1) +(param0, 2) ...
+        // 共5 * 5 = 25种program
         buildAllCombination(0, sub_programs, rule, sub_list, res);
     }
     return res;

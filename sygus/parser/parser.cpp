@@ -296,13 +296,31 @@ namespace {
 }
 
 Json::Value parser::getJsonForSyGuSFile(const std::string &file_name) {
+    // 生成一个临时文件路径，用于存储转换后的 JSON 数据
+    // 使用随机数确保文件名唯一，避免冲突
     std::string oup_file = "/tmp/" + std::to_string(rand()) + ".json";
+
+    // 获取 Python 脚本的路径，该脚本用于将 SyGuS 文件转换为 JSON 格式
+    // config::KSourcePath 是项目的根路径，sygus/parser/python 是脚本所在的子目录
     std::string python_path = config::KSourcePath + "/sygus/parser/python";
+
+    // 构造命令，切换到 Python 脚本目录并执行 main.py 脚本
+    // main.py 脚本接收两个参数：输入的 SyGuS 文件路径和输出的 JSON 文件路径
     std::string command = "cd " + python_path + "; python3 main.py " + file_name + " " + oup_file;
+
+    // 使用 system 函数执行命令，调用 Python 脚本进行文件转换
     system(command.c_str());
+
+    // 读取生成的 JSON 文件内容，并将其解析为 Json::Value 对象
     Json::Value root = json::loadJsonFromFile(oup_file);
+
+    // 构造命令，删除临时 JSON 文件，避免占用磁盘空间
     command = "rm " + oup_file;
+
+    // 使用 system 函数执行命令，删除临时文件
     system(command.c_str());
+
+    // 返回解析后的 JSON 数据
     return root;
 }
 
